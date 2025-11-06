@@ -68,9 +68,16 @@ func (s *stepMountImage) Run(ctx context.Context, state multistep.StateBag) mult
 
 		mntpnt := filepath.Join(s.MountPath, mntAndPart.mnt)
 
+		// Create directory if it does not exist
+		err := os.MkdirAll(mntpnt, os.ModePerm)
+		if err != nil {
+			ui.Error(fmt.Sprintf("Failed to create mount point %s: %s", mntpnt, err.Error()))
+			return multistep.ActionHalt
+		}
+
 		ui.Message(fmt.Sprintf("Mounting: %s", mntAndPart.part))
 
-		err := run(ctx, state, fmt.Sprintf(
+		err = run(ctx, state, fmt.Sprintf(
 			"mount %s %s",
 			mntAndPart.part, mntpnt))
 		if err != nil {

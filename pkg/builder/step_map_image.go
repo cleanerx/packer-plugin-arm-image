@@ -46,62 +46,76 @@ func (s *stepMapImage) Run(_ context.Context, state multistep.StateBag) multiste
 	}
 	path := strings.TrimSpace(string(out))
 	loop := strings.Split(path, "/")[2]
-	prefix := loop + "p"
+	partPrefix := loop + "p"
 
-	time.Sleep(2 * time.Second)
-	// Look for all partitions of created loopback
-	var partitions []string
-	cPartitions := make(chan []string)
-	action := make(chan multistep.StepAction)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			select {
-			default:
-				files, err := os.ReadDir("/dev/")
-				if err != nil {
-					ui.Error("Couldn't list devices in /dev/")
-					s.Cleanup(state)
-					action <- multistep.ActionHalt
-					return
-				}
 
-				for _, file := range files {
-					if strings.HasPrefix(file.Name(), prefix) {
-						partitions = append(partitions, "/dev/"+file.Name())
-					}
-				}
+    // Wait for udev to settle
+    _ = exec.Command("udevadm", "settle").Run()
 
-				if len(partitions) == 0 {
-					continue
-				} else {
-					cPartitions <- partitions
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
 
-	select {
-	case action := <-action:
-		return action
-	case partitions = <-cPartitions:
-		partPrefix := "/dev/" + prefix
-		// sort by files by partition number, to make sure they match the partition map.
-		sort.Slice(partitions, func(i, j int) bool {
-			n_i, _ := strconv.Atoi(partitions[i][len(partPrefix):])
-			n_j, _ := strconv.Atoi(partitions[j][len(partPrefix):])
-			return n_i < n_j
-		})
-	case <-time.After(60*time.Second):
-		cancel()
-	}
+    var partitions []string
+    found := false
 
-	state.Put(s.ResultKey, partitions)
+    // Scan with lsblk for partitions and LVM volumes
+    for retries := 0; retries < 30; retries++ {
+        lsblkOut, err := exec.Command("lsblk", "-ln", "-o", "NAME,TYPE", path).Output()
+        if err != nil {
+            ui.Error(fmt.Sprintf("lsblk failed: %v", err))
+            break
+        }
 
-	return multistep.ActionContinue
+        lines := strings.Split(string(lsblkOut), "\n")
+        for _, line := range lines {
+            fields := strings.Fields(line)
+            if len(fields) != 2 {
+                continue
+            }
+            name, typ := fields[0], fields[1]
+            if strings.HasPrefix(name, partPrefix) && typ == "part" {
+                partitions = append(partitions, "/dev/"+name)
+            }
+        }
+
+        if len(partitions) > 0 {
+            found = true
+            break
+        }
+        time.Sleep(1 * time.Second)
+    }
+
+    // Always scan /dev/mapper for LVM volumes
+    mapperFiles, _ := os.ReadDir("/dev/mapper/")
+    for _, file := range mapperFiles {
+        if strings.HasPrefix(file.Name(), loop) || strings.Contains(file.Name(), "ubuntu--vg") {
+            partitions = append(partitions, "/dev/mapper/"+file.Name())
+            found = true
+        }
+    }
+
+    if !found || len(partitions) == 0 {
+        ui.Error("No partitions or LVM volumes found. GPT or LVM layout may not be detected.")
+        s.Cleanup(state)
+        return multistep.ActionHalt
+    }
+
+    // Sort loopXpN partitions numerically
+    sort.SliceStable(partitions, func(i, j int) bool {
+        pi := partitions[i]
+        pj := partitions[j]
+        if strings.HasPrefix(pi, "/dev/"+partPrefix) && strings.HasPrefix(pj, "/dev/"+partPrefix) {
+            n_i, _ := strconv.Atoi(strings.TrimPrefix(pi, "/dev/"+partPrefix))
+            n_j, _ := strconv.Atoi(strings.TrimPrefix(pj, "/dev/"+partPrefix))
+            return n_i < n_j
+        }
+        return pi < pj // fallback alphabetical
+    })
+
+    state.Put(s.ResultKey, partitions)
+    ui.Message(fmt.Sprintf("Mapped partitions and volumes: %v", partitions))
+
+    return multistep.ActionContinue
+
+
 }
 
 func (s *stepMapImage) Cleanup(state multistep.StateBag) {
